@@ -1,0 +1,119 @@
+--- a/xnu/cepheus_touch.c
++++ b/xnu/cepheus_touch.c
+@@ -58,6 +58,7 @@
+ #include "cepheus_gpi_layout.h"
+ #include "cepheus_i2c_bitbang.h"
+ #include "cepheus_touch_diag.h"
++#include "cepheus_fts_resume.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -65,6 +66,7 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern int cepheus_touch_power_enable(void);
+ void sweet_touch_init(void);
++void cepheus_touch_display_power(int on);
+ 
+ #define TOUCH_SE_PA      0x00c80000u  /* qupv3_se17_i2c: i2c@0xc80000 */
+ #define TOUCH_GCC_PA     0x00100000u
+@@ -140,6 +142,15 @@
+ static struct cepheus_bb touch_bb;
+ static int touch_diag_enabled;
+ static struct cepheus_touch_diag touch_diag;
++static unsigned touch_display_on = 1;
++
++/* The framebuffer callback only publishes state. GPIO/I2C access stays
++ * serialized on touch_thread, outside the framebuffer's lock/workloop. */
++void
++cepheus_touch_display_power(int on)
++{
++	__atomic_store_n(&touch_display_on, on ? 1u : 0u, __ATOMIC_RELEASE);
++}
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -525,6 +536,40 @@
+ 	}
+ 	touch_report(frame.active, frame.x, frame.y);
+ 	return 0;
++}
++
++static int
++touch_scan(void *ctx, int enabled)
++{
++	(void)ctx;
++	const uint8_t scan[] = {0xa0, 0x00, enabled ? 0x01 : 0x00};
++	return touch_msg(TOUCH_I2C_ADDR, scan, sizeof(scan), NULL, 0, false);
++}
++
++static void
++touch_resume_reset(void *ctx, int high)
++{
++	(void)ctx;
++	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, high != 0);
++}
++
++static void
++touch_resume_wait(void *ctx, unsigned ms)
++{
++	(void)ctx;
++	touch_wait(ms);
++}
++
++static int
++touch_resume_read(void *ctx, uint8_t event[8])
++{
++	(void)ctx;
++	int err = fts_read_cmd(FTS_CMD_READ_ALL_EVENTS, event, 8);
++	if (!err && event[0]) {
++		printf("CEPHEUS TOUCH RESUME EVENT: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    event[0], event[1], event[2], event[3], event[4], event[5], event[6], event[7]);
++	}
++	return err;
+ }
+ 
+ static bool
+@@ -756,7 +801,27 @@
+ 	printf("SWEET TOUCH (cepheus): selected ST-FTS, %dx%d, poll=10ms irq-hint=%d\n",
+ 	    TOUCH_X_MAX, TOUCH_Y_MAX, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
++	int resume = 0;
++	(void)PE_parse_boot_argn("sweettouchresume", &resume, sizeof(resume));
++	bool scan_on = true;
++	const struct cepheus_fts_resume_ops resume_ops = {
++		NULL, touch_resume_reset, touch_resume_wait, touch_resume_read, touch_scan
++	};
+ 	while (!st.dead) {
++		if (resume) {
++			bool on = __atomic_load_n(&touch_display_on, __ATOMIC_ACQUIRE) != 0;
++			if (on != scan_on) {
++				touch_report(0, st.x, st.y);
++				int err = on ? cepheus_fts_resume(&resume_ops) : touch_scan(NULL, 0);
++				printf("CEPHEUS TOUCH POWER: %s err=%d\n", on ? "resume" : "suspend", err);
++				if (err) { goto out; }
++				scan_on = on;
++				/* Recheck power after the bounded reset before reporting
++				 * contacts; off may have arrived while reset was running. */
++				continue;
++			}
++			if (!scan_on) { touch_wait(10); continue; }
++		}
+ 		/* Optional IRQ hint still reads every 100 ms, and always while down. */
+ 		if (!st.irq_hint || st.active ||
+ 		    !(touch_rd(st.south, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+--- a/xnu/0082-stage-cepheus-touch.sh
++++ b/xnu/0082-stage-cepheus-touch.sh
+@@ -9,3 +9,4 @@
+ install -m 0644 "$here/cepheus_gpi_layout.h" bsd/dev/cepheus_gpi_layout.h
+ install -m 0644 "$here/cepheus_i2c_bitbang.h" bsd/dev/cepheus_i2c_bitbang.h
+ install -m 0644 "$here/cepheus_touch_diag.h" bsd/dev/cepheus_touch_diag.h
++install -m 0644 "$here/cepheus_fts_resume.h" bsd/dev/cepheus_fts_resume.h
+--- a/scripts/build-kernel-patches.sh
++++ b/scripts/build-kernel-patches.sh
+@@ -20,5 +20,6 @@
+ install -m 644 "$ROOT/xnu/cepheus_gpi_layout.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_i2c_bitbang.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_touch_diag.h" "$DEST/xnu/patches/"
++install -m 644 "$ROOT/xnu/cepheus_fts_resume.h" "$DEST/xnu/patches/"
+ echo "installed 0082-cepheus-touch.patch into $DEST/xnu/patches"
+ ls -l "$DEST/xnu/patches/" | tail -3
