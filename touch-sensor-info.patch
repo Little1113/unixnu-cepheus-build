@@ -1,0 +1,124 @@
+--- a/xnu/cepheus_touch.c
++++ b/xnu/cepheus_touch.c
+@@ -59,6 +59,7 @@
+ #include "cepheus_i2c_bitbang.h"
+ #include "cepheus_touch_diag.h"
+ #include "cepheus_fts_resume.h"
++#include "cepheus_fts_info.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -143,6 +144,7 @@
+ static int touch_diag_enabled;
+ static struct cepheus_touch_diag touch_diag;
+ static unsigned touch_display_on = 1;
++static int touch_info_enabled;
+ 
+ /* The framebuffer callback only publishes state. GPIO/I2C access stays
+  * serialized on touch_thread, outside the framebuffer's lock/workloop. */
+@@ -468,6 +470,63 @@
+ 		return err;
+ 	}
+ 	return touch_msg(TOUCH_I2C_ADDR, NULL, 0, buf, len, false);
++}
++
++/* FTM5 I2C framebuffer read: 0xA6 + 16-bit address, no dummy byte.
++ * Uses only documented read operations; never requests load/calibration/flash. */
++static int
++touch_read_memory(uint16_t address, uint8_t *buf, unsigned len)
++{
++	if (!st.gpio_i2c || !len || len > 256 || (uint32_t)address + len > 0x10000u) { return EINVAL; }
++	const uint8_t cmd[] = {0xa6, (uint8_t)(address >> 8), (uint8_t)address};
++	return cepheus_bb_xfer(&touch_bb, TOUCH_I2C_ADDR, cmd, sizeof(cmd), buf, len);
++}
++
++static int
++touch_info_frame(const char *label, uint16_t addr, unsigned words)
++{
++	if (!cepheus_info_range(addr, words)) {
++		printf("CEPHEUS SENSOR: %s invalid range addr=%#x words=%u\n", label, addr, words);
++		return 0; /* Invalid firmware metadata is not a bus error. */
++	}
++	uint8_t data[2 * CEPHEUS_CHANNEL_LIMIT] = {0};
++	int err = touch_read_memory(addr, data, 2 * words);
++	if (err) { printf("CEPHEUS SENSOR: %s read err=%d\n", label, err); return err; }
++	struct cepheus_fts_stats stats;
++	if (!cepheus_info_stats(data, 2 * words, &stats)) { return EINVAL; }
++	printf("CEPHEUS SENSOR: %s addr=%#x n=%u min=%d max=%d hash=%#x\n",
++	    label, addr, words, stats.min, stats.max, stats.hash);
++	/* Up to the first eight samples; do not flood the event log. */
++	for (unsigned i = 0; i < words && i < 8; ++i) {
++		printf("CEPHEUS SAMPLE: %s [%u]=%d\n", label, i, cepheus_info_s16(data + 2 * i));
++	}
++	return 0;
++}
++
++static void
++touch_info_snapshot(unsigned snapshot)
++{
++	uint8_t data[CEPHEUS_SYSINFO_SIZE] = {0};
++	int err = touch_read_memory(0, data, sizeof(data));
++	printf("CEPHEUS SYSINFO: snapshot=%u read=%d header=%02x:%02x:%02x:%02x\n",
++	    snapshot, err, data[0], data[1], data[2], data[3]);
++	if (err) { return; }
++	struct cepheus_fts_info info;
++	if (!cepheus_info_parse(data, sizeof(data), &info)) { return; }
++	printf("CEPHEUS SYSINFO: fw=%04x cfg=%04x project=%04x cx=%04x cxproject=%04x afe=%02x:%02x:%02x proto=%02x crc=%08x:%08x xy=%u,%u tx=%u rx=%u dbg=%04x\n",
++	    info.fw, info.cfg, info.project, info.cx, info.cx_project,
++	    info.cfg_afe, info.cx_afe, info.panel_afe, info.protocol, info.fw_crc, info.cfg_crc,
++	    info.x, info.y, info.tx, info.rx, info.debug_addr);
++	uint8_t crc = 0;
++	err = fts_read_hw(0x20000078u, &crc, 1);
++	printf("CEPHEUS SYSINFO: hardware-crc read=%d value=%02x\n", err, crc);
++	if (err) { return; }
++	if (touch_info_frame("ms-raw-row0", info.ms_raw, info.rx)) { return; }
++	if (touch_info_frame("ms-strength-row0", info.ms_strength, info.rx)) { return; }
++	if (touch_info_frame("ss-tx-raw", info.ss_tx_raw, info.tx)) { return; }
++	if (touch_info_frame("ss-tx-strength", info.ss_tx_strength, info.tx)) { return; }
++	if (touch_info_frame("ss-rx-raw", info.ss_rx_raw, info.rx)) { return; }
++	(void)touch_info_frame("ss-rx-strength", info.ss_rx_strength, info.rx);
+ }
+ 
+ static void
+@@ -736,6 +795,7 @@
+ 	 */
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchdiag", &touch_diag_enabled, sizeof(touch_diag_enabled));
++	(void)PE_parse_boot_argn("sweettouchinfo", &touch_info_enabled, sizeof(touch_info_enabled));
+ 	printf("SWEET TOUCH (cepheus): starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH (cepheus): mapping GCC/TLMM/SE17\n");
+@@ -801,6 +861,7 @@
+ 	printf("SWEET TOUCH (cepheus): selected ST-FTS, %dx%d, poll=10ms irq-hint=%d\n",
+ 	    TOUCH_X_MAX, TOUCH_Y_MAX, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
++	unsigned info_polls = 0;
+ 	int resume = 0;
+ 	(void)PE_parse_boot_argn("sweettouchresume", &resume, sizeof(resume));
+ 	bool scan_on = true;
+@@ -827,6 +888,9 @@
+ 		    !(touch_rd(st.south, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+ 			int err = touch_fts();
++			if (!err && touch_info_enabled && (++info_polls == 1 || info_polls == 2048)) {
++				touch_info_snapshot(info_polls == 1 ? 1 : 2);
++			}
+ 			if (touch_diag_enabled) {
+ 				if (err) { ++touch_diag.errors; }
+ 				if (cepheus_touch_diag_heartbeat(&touch_diag)) {
+--- a/xnu/0082-stage-cepheus-touch.sh
++++ b/xnu/0082-stage-cepheus-touch.sh
+@@ -10,3 +10,4 @@
+ install -m 0644 "$here/cepheus_i2c_bitbang.h" bsd/dev/cepheus_i2c_bitbang.h
+ install -m 0644 "$here/cepheus_touch_diag.h" bsd/dev/cepheus_touch_diag.h
+ install -m 0644 "$here/cepheus_fts_resume.h" bsd/dev/cepheus_fts_resume.h
++install -m 0644 "$here/cepheus_fts_info.h" bsd/dev/cepheus_fts_info.h
+--- a/scripts/build-kernel-patches.sh
++++ b/scripts/build-kernel-patches.sh
+@@ -21,5 +21,6 @@
+ install -m 644 "$ROOT/xnu/cepheus_i2c_bitbang.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_touch_diag.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_fts_resume.h" "$DEST/xnu/patches/"
++install -m 644 "$ROOT/xnu/cepheus_fts_info.h" "$DEST/xnu/patches/"
+ echo "installed 0082-cepheus-touch.patch into $DEST/xnu/patches"
+ ls -l "$DEST/xnu/patches/" | tail -3
