@@ -1,0 +1,102 @@
+diff --git a/scripts/build-kernel-patches.sh b/scripts/build-kernel-patches.sh
+index f9ebcfc..bbc5562 100644
+--- a/scripts/build-kernel-patches.sh
++++ b/scripts/build-kernel-patches.sh
+@@ -19,5 +19,6 @@ install -m 644 "$ROOT/xnu/cepheus_touch.c" "$ROOT/xnu/cepheus_fts_events.h" "$DE
+ install -m 644 "$ROOT/xnu/cepheus_clock_status.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_gpi_layout.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_i2c_bitbang.h" "$DEST/xnu/patches/"
++install -m 644 "$ROOT/xnu/cepheus_touch_diag.h" "$DEST/xnu/patches/"
+ echo "installed 0082-cepheus-touch.patch into $DEST/xnu/patches"
+ ls -l "$DEST/xnu/patches/" | tail -3
+diff --git a/xnu/0082-stage-cepheus-touch.sh b/xnu/0082-stage-cepheus-touch.sh
+index 03b63a7..9c50d5c 100644
+--- a/xnu/0082-stage-cepheus-touch.sh
++++ b/xnu/0082-stage-cepheus-touch.sh
+@@ -8,3 +8,4 @@ install -m 0644 "$here/cepheus_fts_events.h" bsd/dev/cepheus_fts_events.h
+ install -m 0644 "$here/cepheus_clock_status.h" bsd/dev/cepheus_clock_status.h
+ install -m 0644 "$here/cepheus_gpi_layout.h" bsd/dev/cepheus_gpi_layout.h
+ install -m 0644 "$here/cepheus_i2c_bitbang.h" bsd/dev/cepheus_i2c_bitbang.h
++install -m 0644 "$here/cepheus_touch_diag.h" bsd/dev/cepheus_touch_diag.h
+diff --git a/xnu/cepheus_touch.c b/xnu/cepheus_touch.c
+index 1ead901..f4089c8 100644
+--- a/xnu/cepheus_touch.c
++++ b/xnu/cepheus_touch.c
+@@ -57,6 +57,7 @@
+ #include "cepheus_clock_status.h"
+ #include "cepheus_gpi_layout.h"
+ #include "cepheus_i2c_bitbang.h"
++#include "cepheus_touch_diag.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -137,6 +138,8 @@ static struct {
+ } st;
+ static int touch_sleep_chan;
+ static struct cepheus_bb touch_bb;
++static int touch_diag_enabled;
++static struct cepheus_touch_diag touch_diag;
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -498,6 +501,7 @@ touch_fts(void)
+ 	struct cepheus_fts_state frame = {.active = st.active};
+ 	memcpy(frame.x, st.x, sizeof(frame.x));
+ 	memcpy(frame.y, st.y, sizeof(frame.y));
++	if (touch_diag_enabled) { ++touch_diag.polls; }
+ 	int err = fts_read_cmd(FTS_CMD_READ_ALL_EVENTS, buf, FTS_FIFO_EVENT_SIZE);
+ 	if (err) { return err; }
+ 	unsigned remaining = buf[7] & 0x1fu;
+@@ -511,6 +515,11 @@ touch_fts(void)
+ 	}
+ 	for (unsigned i = 0; i <= remaining; ++i) {
+ 		const uint8_t *e = buf + i * FTS_FIFO_EVENT_SIZE;
++		if (touch_diag_enabled && cepheus_touch_diag_event(&touch_diag, e)) {
++			printf("CEPHEUS TOUCH RAW: %02x %02x %02x %02x %02x %02x %02x %02x rawxy=%u,%u\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
++			    ((unsigned)(e[3] & 15) << 8) | e[2], ((unsigned)e[4] << 4) | (e[3] >> 4));
++		}
+ 		if (e[0] == 0) { break; }
+ 		if (cepheus_fts_event(&frame, e)) { return EIO; }
+ 	}
+@@ -681,6 +690,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	 * below hangs the SoC, the persistent log and the GUI got there first.
+ 	 */
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweettouchdiag", &touch_diag_enabled, sizeof(touch_diag_enabled));
+ 	printf("SWEET TOUCH (cepheus): starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH (cepheus): mapping GCC/TLMM/SE17\n");
+@@ -752,6 +762,20 @@ touch_thread(void *arg, wait_result_t result)
+ 		    !(touch_rd(st.south, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+ 			int err = touch_fts();
++			if (touch_diag_enabled) {
++				if (err) { ++touch_diag.errors; }
++				if (cepheus_touch_diag_heartbeat(&touch_diag)) {
++					printf("CEPHEUS TOUCH POLL: polls=%llu events=%llu empty=%llu errors=%llu ready=%llu icerr=%llu active=%#x irq=%#x reset=%#x vddio=%#x sda=%d scl=%d last=%02x:%02x\n",
++					    (unsigned long long)touch_diag.polls, (unsigned long long)touch_diag.events,
++					    (unsigned long long)touch_diag.empty, (unsigned long long)touch_diag.errors,
++					    (unsigned long long)touch_diag.ready, (unsigned long long)touch_diag.controller_errors,
++					    st.active, touch_rd(st.south, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)),
++					    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_RESET)),
++					    touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_VDDIO)),
++					    touch_bb_sample(NULL, BB_SDA), touch_bb_sample(NULL, BB_SCL),
++					    touch_diag.last[0], touch_diag.last[1]);
++				}
++			}
+ 			if (err) {
+ 				if (st.gpio_i2c && (err == EAGAIN || err == ETIMEDOUT || err == EBUSY)) {
+ 					printf("SWEET TOUCH (cepheus): GPIO bus err=%d; restoring pins and stopping\n", err);
+@@ -772,6 +796,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
++	if (touch_diag_enabled) {
++		printf("CEPHEUS TOUCH EXIT: dead=%d polls=%llu errors=%llu\n", st.dead,
++		    (unsigned long long)touch_diag.polls, (unsigned long long)touch_diag.errors);
++	}
+ 	touch_bb_restore();
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+
