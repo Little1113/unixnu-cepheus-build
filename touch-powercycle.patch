@@ -1,0 +1,116 @@
+--- a/xnu/cepheus_touch.c
++++ b/xnu/cepheus_touch.c
+@@ -40,7 +40,9 @@
+  * Call once after the scheduler is running; all work runs on one thread.
+  * Requires ABL-loaded GENI I2C firmware. No firmware/config upload and no
+  * direct PMIC writes: IC commands read FIFO/chip ID and enable active touch
+- * scan. AVDD L1C is inherited from firmware, not the sweet L11C vote.
++ * scan. AVDD L1C uses a board-specific XOB enable-bit vote, not L11C.
++ * sweettouchcycle=1 additionally performs a bounded L1C/GPIO84 supply cycle
++ * at boot; voltage/mode and controller flash/calibration are not written.
+  * Reset-low pulse is opt-in (sweettouchreset=1); by default preserve boot
+  * firmware's controller state, since firmware loading is not implemented.
+  */
+@@ -60,12 +62,14 @@
+ #include "cepheus_touch_diag.h"
+ #include "cepheus_fts_resume.h"
+ #include "cepheus_fts_info.h"
++#include "cepheus_fts_powercycle.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern int cepheus_touch_power_enable(void);
++extern int cepheus_touch_power_set(int enabled);
+ void sweet_touch_init(void);
+ void cepheus_touch_display_power(int on);
+ 
+@@ -631,6 +635,20 @@
+ 	return err;
+ }
+ 
++static int
++touch_cycle_l1c(void *ctx, int enabled)
++{
++	(void)ctx;
++	return cepheus_touch_power_set(enabled);
++}
++
++static void
++touch_cycle_vddio(void *ctx, int enabled)
++{
++	(void)ctx;
++	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, enabled != 0);
++}
++
+ static bool
+ touch_smmu_probe(void)
+ {
+@@ -812,7 +830,13 @@
+ 	}
+ 	int power = 0;
+ 	(void)PE_parse_boot_argn("sweettouchpower", &power, sizeof(power));
+-	if (power) {
++	int cycle = 0;
++	(void)PE_parse_boot_argn("sweettouchcycle", &cycle, sizeof(cycle));
++	if (cycle && (!power || !st.gpio_i2c)) {
++		printf("CEPHEUS CYCLE: requires explicit GPIO transport and L1C power opt-ins\n");
++		goto out;
++	}
++	if (power && !cycle) {
+ 		if (!st.gpio_i2c || cepheus_touch_power_enable() != 0) { goto out; }
+ 		touch_wait(10);
+ 	}
+@@ -826,16 +850,26 @@
+ 		touch_gpio(TOUCH_PIN_SCL, 1, 0, 0, false, false);
+ 	}
+ 	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);
+-	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
+-	touch_wait(10);
+-	int reset = 0;
+-	(void)PE_parse_boot_argn("sweettouchreset", &reset, sizeof(reset));
+-	if (reset) {
+-		touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
++	if (cycle) {
++		const struct cepheus_fts_powercycle_ops cycle_ops = {
++			NULL, touch_cycle_l1c, touch_cycle_vddio, touch_resume_reset, touch_resume_wait
++		};
++		printf("CEPHEUS CYCLE: starting bounded L1C/GPIO84/reset recovery\n");
++		int err = cepheus_fts_powercycle(&cycle_ops);
++		printf("CEPHEUS CYCLE: complete err=%d\n", err);
++		if (err) { goto out; }
++	} else {
++		touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
+ 		touch_wait(10);
+-	}
+-	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
+-	touch_wait(300);
++		int reset = 0;
++		(void)PE_parse_boot_argn("sweettouchreset", &reset, sizeof(reset));
++		if (reset) {
++			touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
++			touch_wait(10);
++		}
++		touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
++		touch_wait(300);
++	}
+ 	printf("SWEET TOUCH (cepheus): powered RESET cfg=%#x io=%#x VDDIO cfg=%#x io=%#x\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(12)), touch_rd(st.gpio, TOUCH_GPIO_IO(12)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(84)), touch_rd(st.gpio, TOUCH_GPIO_IO(84)));
+--- a/xnu/0082-stage-cepheus-touch.sh
++++ b/xnu/0082-stage-cepheus-touch.sh
+@@ -11,3 +11,4 @@
+ install -m 0644 "$here/cepheus_touch_diag.h" bsd/dev/cepheus_touch_diag.h
+ install -m 0644 "$here/cepheus_fts_resume.h" bsd/dev/cepheus_fts_resume.h
+ install -m 0644 "$here/cepheus_fts_info.h" bsd/dev/cepheus_fts_info.h
++install -m 0644 "$here/cepheus_fts_powercycle.h" bsd/dev/cepheus_fts_powercycle.h
+--- a/scripts/build-kernel-patches.sh
++++ b/scripts/build-kernel-patches.sh
+@@ -22,5 +22,6 @@
+ install -m 644 "$ROOT/xnu/cepheus_touch_diag.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_fts_resume.h" "$DEST/xnu/patches/"
+ install -m 644 "$ROOT/xnu/cepheus_fts_info.h" "$DEST/xnu/patches/"
++install -m 644 "$ROOT/xnu/cepheus_fts_powercycle.h" "$DEST/xnu/patches/"
+ echo "installed 0082-cepheus-touch.patch into $DEST/xnu/patches"
+ ls -l "$DEST/xnu/patches/" | tail -3
